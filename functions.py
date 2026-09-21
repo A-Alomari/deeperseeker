@@ -1060,6 +1060,99 @@ async def create_new_chat(auth_token):
     return data["data"]["biz_data"]["chat_session"]["id"]
 
 
+_EMPTY_SSE_DEFAULT = (
+    "Empty response from DeepSeek (no parseable SSE content): "
+    "stream ended with no assistant fragments"
+)
+_EMPTY_SSE_CONTEXT = (
+    "Empty response from DeepSeek (prompt may exceed the session context limit)"
+)
+_CONTEXT_LIMIT_HINT_RE = re.compile(
+    r"context|token.?limit|maximum.?context|too.?long|exceed",
+    re.IGNORECASE,
+)
+_SSE_RECENT_LINES = 8
+
+
+class _SseStreamFinished(Exception):
+    pass
+
+
+def _redact_sse_line(line: str) -> str:
+    if len(line) > 500:
+        return line[:500] + "..."
+    return line
+
+
+def _remember_sse_line(recent_lines, line: str):
+    recent_lines.append(_redact_sse_line(line))
+    if len(recent_lines) > _SSE_RECENT_LINES:
+        del recent_lines[0]
+
+
+def _sse_context_limit_hint(recent_lines, parsed_events):
+    for obj in parsed_events:
+        try:
+            blob = json.dumps(obj, ensure_ascii=False)
+        except Exception:
+            blob = str(obj)
+        if _CONTEXT_LIMIT_HINT_RE.search(blob):
+            return True
+    for line in recent_lines:
+        if _CONTEXT_LIMIT_HINT_RE.search(line):
+            return True
+    return False
+
+
+def _scan_recent_sse_errors(parsed_events):
+    """Return (http_status, message) if a recent parsed event is an upstream error."""
+    for obj in reversed(parsed_events):
+        if not isinstance(obj, dict) or obj.get("type") != "error":
+            continue
+        content = obj.get("content") or obj.get("message") or "Upstream error"
+        finish = str(obj.get("finish_reason") or "")
+        if finish == "rate_limit_reached" or "rate_limit" in finish.lower():
+            return 429, content
+        if finish in ("permission_denied", "forbidden"):
+            return 403, content
+        return 502, content
+    return None
+
+
+def _raise_empty_sse_response(recent_lines, parsed_events):
+    err = _scan_recent_sse_errors(parsed_events)
+    if err:
+        code, msg = err
+        logger.warning(
+            "DeepSeek SSE error event (not empty stream); last events: %s",
+            recent_lines[-_SSE_RECENT_LINES:],
+        )
+        raise Exception(f"HTTP {code}: {msg}")
+    if _sse_context_limit_hint(recent_lines, parsed_events):
+        msg = _EMPTY_SSE_CONTEXT
+    else:
+        msg = _EMPTY_SSE_DEFAULT
+    logger.warning(
+        "DeepSeek SSE ended without assistant output; last events: %s",
+        recent_lines[-_SSE_RECENT_LINES:],
+    )
+    raise Exception(msg)
+
+
+def _raise_sse_error_event(data, recent_lines):
+    content = data.get("content") or data.get("message") or "Upstream error"
+    finish = str(data.get("finish_reason") or "")
+    if finish == "rate_limit_reached" or "rate_limit" in finish.lower():
+        logger.warning(
+            "DeepSeek SSE error event (not empty stream); last events: %s",
+            recent_lines[-_SSE_RECENT_LINES:],
+        )
+        raise Exception(f"HTTP 429: {content}")
+    if finish in ("permission_denied", "forbidden"):
+        raise Exception(f"HTTP 403: {content}")
+    raise Exception(f"HTTP 502: {content}")
+
+
 async def send_message(chat_id, auth_token, message, parent_message_id, thinking=False, search=False, file_ids_=None):
     # Backup: WAF cookies not required with Android headers. Kept as fallback:
     # cookie = await get_cookies()
@@ -1093,30 +1186,32 @@ async def send_message(chat_id, auth_token, message, parent_message_id, thinking
             logger.warning("DeepSeek completion HTTP %d for chat %s: %s", resp.status, chat_id, error_text[:300])
             raise Exception(f"HTTP {resp.status}: {error_text}")
 
-        async for line in resp.content:
-            if not line:
-                continue
-            decoded_line = line.decode("utf-8").strip()
-            if not decoded_line.startswith("data: "):
-                continue
-            try:
-                data = json.loads(decoded_line[6:])
-            except Exception:
-                continue
+        recent_lines = []
+        parsed_events = []
+        line_buf = b""
+
+        async def _emit_from_event(data):
+            nonlocal think_open, got_output
+            if isinstance(data, dict) and data.get("type") == "error":
+                _raise_sse_error_event(data, recent_lines)
+
+            if data.get("o") == "BATCH" and isinstance(data.get("v"), list):
+                for op in data["v"]:
+                    if not isinstance(op, dict):
+                        continue
+                    if op.get("p") == "quasi_status" and op.get("v") == "FINISHED":
+                        continue
+                    async for chunk in _emit_from_event(op):
+                        yield chunk
+                return
+
             if data.get("p") == "response/status" and data.get("v") == "FINISHED":
                 if think_open:
                     yield "\n</think>\n\n"
                 if not got_output:
-                    raise Exception("Empty response from DeepSeek (prompt may exceed the session context limit)")
-                return
-            if data.get("o") == "BATCH" and isinstance(data.get("v"), list):
-                for op in data["v"]:
-                    if isinstance(op, dict) and op.get("p") == "quasi_status" and op.get("v") == "FINISHED":
-                        if think_open:
-                            yield "\n</think>\n\n"
-                        if not got_output:
-                            raise Exception("Empty response from DeepSeek (prompt may exceed the session context limit)")
-                        return
+                    _raise_empty_sse_response(recent_lines, parsed_events)
+                raise _SseStreamFinished()
+
             if "v" in data and isinstance(data["v"], dict) and "response" in data["v"]:
                 fragments = data["v"]["response"].get("fragments")
                 if fragments:
@@ -1133,7 +1228,7 @@ async def send_message(chat_id, auth_token, message, parent_message_id, thinking
                                 think_open = False
                             got_output = True
                             yield fragment.get("content", "")
-                continue
+                return
 
             if data.get("p") == "response/fragments" and data.get("o") == "APPEND":
                 fragments = data.get("v")
@@ -1154,16 +1249,59 @@ async def send_message(chat_id, auth_token, message, parent_message_id, thinking
                         else:
                             got_output = True
                             yield fragment.get("content", "")
-                continue
+                return
 
             v = data.get("v")
             if isinstance(v, str) and v:
                 got_output = True
                 yield v
+
+        async def _consume_sse_line(decoded_line: str):
+            if not decoded_line.startswith("data: "):
+                return
+            _remember_sse_line(recent_lines, decoded_line)
+            try:
+                data = json.loads(decoded_line[6:])
+            except Exception:
+                return
+            if isinstance(data, dict):
+                parsed_events.append(data)
+                if len(parsed_events) > _SSE_RECENT_LINES:
+                    del parsed_events[0]
+            try:
+                async for chunk in _emit_from_event(data):
+                    yield chunk
+            except _SseStreamFinished:
+                raise
+
+        async for chunk in resp.content.iter_any():
+            if not chunk:
+                continue
+            line_buf += chunk
+            while b"\n" in line_buf:
+                raw_line, line_buf = line_buf.split(b"\n", 1)
+                decoded_line = raw_line.decode("utf-8", errors="replace").strip()
+                if not decoded_line:
+                    continue
+                try:
+                    async for out in _consume_sse_line(decoded_line):
+                        yield out
+                except _SseStreamFinished:
+                    return
+
+        if line_buf.strip():
+            decoded_line = line_buf.decode("utf-8", errors="replace").strip()
+            if decoded_line:
+                try:
+                    async for out in _consume_sse_line(decoded_line):
+                        yield out
+                except _SseStreamFinished:
+                    return
+
         if think_open:
             yield "\n</think>\n\n"
         if not got_output:
-            raise Exception("Empty response from DeepSeek (prompt may exceed the session context limit)")
+            _raise_empty_sse_response(recent_lines, parsed_events)
 
 
 async def upload_file(file_bytes, file_name, file_content_type, auth_token):
