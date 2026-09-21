@@ -360,9 +360,13 @@ def check_key(request: Request):
     return secrets.compare_digest(key.encode("utf-8"), API_KEY.encode("utf-8"))
 
 
+def _upstream_http_code(exc):
+    m = re.match(r"HTTP (\d{3}):", str(exc))
+    return int(m.group(1)) if m else None
+
+
 def _api_error_response(e, is_anthropic=False):
-    m = re.match(r"HTTP (\d{3}):", str(e))
-    code = int(m.group(1)) if m else 502
+    code = _upstream_http_code(e) or 502
     if isinstance(e, CookieGenerationError):
         code = 503  # WAF cookies cannot be produced right now — upstream unreachable, not a client error
     if code < 400 or code > 599:
@@ -370,7 +374,8 @@ def _api_error_response(e, is_anthropic=False):
     if is_anthropic:
         payload = {"type": "error", "error": {"type": "api_error", "message": str(e)[:500]}}
     else:
-        payload = {"error": {"message": str(e)[:500], "type": "api_error", "code": code}}
+        err_type = "rate_limit_error" if code == 429 else "api_error"
+        payload = {"error": {"message": str(e)[:500], "type": err_type, "code": code}}
     return JSONResponse(payload, status_code=code)
 
 
@@ -392,7 +397,19 @@ async def _preflight_stream(gen):
     return _replay_stream(gen, first)
 
 
-async def handle_chat(messages, model, thinking=False, search=False, stream=False, tools=None, is_anthropic=False, req_model=None, scope="", _retried=False):
+async def handle_chat(
+    messages,
+    model,
+    thinking=False,
+    search=False,
+    stream=False,
+    tools=None,
+    is_anthropic=False,
+    req_model=None,
+    scope="",
+    _retried=False,
+    _auth_rotated=False,
+):
     auth_token = get_auth_token()
     if not auth_token:
         return JSONResponse({"error": "No auth token. Add via dashboard."}, status_code=401)
@@ -520,6 +537,21 @@ async def handle_chat(messages, model, thinking=False, search=False, stream=Fals
         return JSONResponse({"error": "Token expired"}, status_code=503)
     _set_key_name(tok.get("alias"))
 
+    if parent_message_id != 0 and needs_rollover(messages):
+        logger.info(
+            "Context rollover: accumulated context over limit; purging session mappings for chat %s",
+            session_id,
+        )
+        delete_sessions_for_chat(token_id, session_id)
+        scratch_chat = await create_new_chat(tok["token"])
+        summary_gen = send_message(
+            scratch_chat, tok["token"], build_summary_request_prompt(messages), 0, False, False, []
+        )
+        rollover_summary = strip_summary_tags(await collect_response(summary_gen))[: MAX_SUMMARY_TOKENS * 4]
+        session_id = await create_new_chat(tok["token"])
+        save_session(sig, token_id, session_id, 0)
+        parent_message_id = 0
+
     is_first = parent_message_id == 0
     # Stage 0.3: hold this chat's lock across the whole send -> save critical
     # section; for streams, ownership transfers to the response generator via
@@ -558,15 +590,45 @@ async def handle_chat(messages, model, thinking=False, search=False, stream=Fals
             save_session(next_sig, token_id, session_id, next_parent(parent_message_id))
             return format_response(resp_text, model, messages, tools)
     except Exception as e:
-        logger.exception("Chat request failed (session %s, parent %s): %s", session_id, parent_message_id, e)
-        m = re.match(r"HTTP (\d{3}):", str(e))
-        code = int(m.group(1)) if m else None
+        code = _upstream_http_code(e)
         if code in (401, 403, 429):
             mark_limited(token_id)
+            delete_sessions_for_chat(token_id, session_id)
+            if not _auth_rotated:
+                new_token_id = pick_token()
+                if new_token_id and new_token_id != token_id:
+                    logger.warning(
+                        "Upstream HTTP %s on token #%s (session %s); rotating to token #%s",
+                        code,
+                        token_id,
+                        session_id,
+                        new_token_id,
+                    )
+                    lock_owner.release()
+                    return await handle_chat(
+                        messages,
+                        model,
+                        thinking,
+                        search,
+                        stream,
+                        tools,
+                        is_anthropic,
+                        req_model,
+                        scope,
+                        _retried=_retried,
+                        _auth_rotated=True,
+                    )
+            logger.warning(
+                "Chat request rejected by upstream (session %s, parent %s): %s",
+                session_id,
+                parent_message_id,
+                e,
+            )
+            return _api_error_response(e, is_anthropic)
+
+        logger.exception("Chat request failed (session %s, parent %s): %s", session_id, parent_message_id, e)
         delete_sessions_for_chat(token_id, session_id)
         if _retried:
-            return _api_error_response(e, is_anthropic)
-        if code not in (401, 403, 429) and parent_message_id == 0:
             return _api_error_response(e, is_anthropic)
         # PR #26 review fix (Blocker 2 — retry self-deadlock): the recursive
         # call can resolve to the SAME chat (the retry re-derives the session
@@ -578,7 +640,19 @@ async def handle_chat(messages, model, thinking=False, search=False, stream=Fals
         # a no-op, the retry re-acquires cleanly, and queued same-chat requests
         # are no longer starved for the entire retry either.
         lock_owner.release()
-        return await handle_chat(messages, model, thinking, search, stream, tools, is_anthropic, req_model, scope, _retried=True)
+        return await handle_chat(
+            messages,
+            model,
+            thinking,
+            search,
+            stream,
+            tools,
+            is_anthropic,
+            req_model,
+            scope,
+            _retried=True,
+            _auth_rotated=_auth_rotated,
+        )
     finally:
         if not lock_transferred:
             lock_owner.release()
@@ -664,11 +738,14 @@ async def stream_response(gen, model, messages, token_id, session_id, sig, tools
         raise
     except Exception as e:
         failed = True
-        m = re.match(r"HTTP (\d{3}):", str(e))
-        code = int(m.group(1)) if m else None
+        code = _upstream_http_code(e)
         if code in (401, 403, 429):
             mark_limited(token_id)
-        logger.exception("stream_response failed")
+            delete_sessions_for_chat(token_id, session_id)
+            logger.warning("stream_response upstream HTTP %s: %s", code, e)
+        else:
+            delete_sessions_for_chat(token_id, session_id)
+            logger.exception("stream_response failed")
         try:
             yield f"data: {json.dumps({'error': {'message': str(e)[:300]}})}\n\n"
         except Exception:
@@ -784,11 +861,14 @@ async def stream_anthropic_response(gen, model, messages, token_id, session_id, 
         raise
     except Exception as e:
         failed = True
-        m = re.match(r"HTTP (\d{3}):", str(e))
-        code = int(m.group(1)) if m else None
+        code = _upstream_http_code(e)
         if code in (401, 403, 429):
             mark_limited(token_id)
-        logger.exception("stream_anthropic_response failed")
+            delete_sessions_for_chat(token_id, session_id)
+            logger.warning("stream_anthropic_response upstream HTTP %s: %s", code, e)
+        else:
+            delete_sessions_for_chat(token_id, session_id)
+            logger.exception("stream_anthropic_response failed")
         try:
             yield f"event: error\ndata: {json.dumps({'type': 'error', 'error': {'type': 'api_error', 'message': str(e)[:300]}})}\n\n"
         except Exception:
